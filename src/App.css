@@ -42,6 +42,19 @@ body {
 .green { color: #27ae60; font-weight: bold; }
 .small { font-size: 10px; color: #888; }
 
+.device-select {
+  padding: 2px 4px;
+  border-radius: 4px;
+  border: 1px solid #ddd;
+  font-size: 11px;
+  background-color: #fff;
+  cursor: pointer;
+  outline: none;
+}
+.device-select:focus {
+  border-color: #007f8b;
+}
+
 /* Monitor Central */
 .monitor-container {
   flex: 1;
@@ -122,6 +135,29 @@ video {
   border-radius: 4px;
   font-size: 10px;
   cursor: pointer;
+}
+
+.image-test-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  width: 100%;
+}
+
+.static-viewport {
+  border: 1px solid #ddd;
+  background: #eee;
+}
+
+.secondary-btn {
+  background: #6c757d;
+  font-size: 11px;
+  padding: 8px 16px;
+}
+
+.secondary-btn:hover {
+  background: #5a6268;
 }
 
 .status-bar { padding: 15px; text-align: center; border-top: 1px solid #f0f0f0; }

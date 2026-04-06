@@ -11,76 +11,161 @@ interface LogEntry {
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [detector, setDetector] = useState<ObjectDetector | null>(null);
+  const detectorRef = useRef<ObjectDetector | null>(null);
+  const [device, setDevice] = useState<'GPU' | 'CPU'>('GPU');
+  const [model, setModel] = useState<'efficientdet_lite0' | 'ssd_mobilenet_v2'>('efficientdet_lite0');
+  const [precision, setPrecision] = useState<'float32' | 'float16' | 'int8'>('float16');
   const [detections, setDetections] = useState<any[]>([]);
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [testMode, setTestMode] = useState<'webcam' | 'image'>('webcam');
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const requestRef = useRef<number | null>(null);
 
-  // Helper to add logs to the console panel
+  // --- NEW PERFORMANCE STATES ---
+  const [fps, setFps] = useState<number>(0);
+  const [latency, setLatency] = useState<number>(0);
+  const lastFrameTime = useRef<number>(performance.now());
+
   const addLog = useCallback((msg: string, type: LogEntry['type'] = 'info') => {
     const time = new Date().toLocaleTimeString('en-US', { hour12: true });
     setLogs(prev => [{ time, msg, type }, ...prev].slice(0, 20));
   }, []);
 
-  // Initialize MediaPipe Detector
   useEffect(() => {
+    let instance: ObjectDetector | null = null;
+    let isActive = true;
+
     const initDetector = async () => {
-      addLog("Initializing MediaPipe Graph...", "info");
+      setIsLoading(true);
+      addLog(`Initializing MediaPipe Graph with ${device}...`, "info");
       try {
         const vision = await FilesetResolver.forVisionTasks(
           "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.2/wasm"
         );
 
-        const instance = await ObjectDetector.createFromOptions(vision, {
+          instance = await ObjectDetector.createFromOptions(vision, {
           baseOptions: {
-            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/1/efficientdet_lite0.tflite`,
-            delegate: "GPU"
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/object_detector/${model}/${precision}/1/${model}.tflite`,
+            delegate: device
           },
-          scoreThreshold: 0.2, // Slightly lower to catch more objects
-          runningMode: "VIDEO"
+          scoreThreshold: 0.3,
+          runningMode: testMode === 'webcam' ? "VIDEO" : "IMAGE"
         });
 
-        setDetector(instance);
-        setIsLoading(false);
-        addLog("Graph successfully started running.", "success");
+        if (isActive) {
+          detectorRef.current = instance;
+          setIsLoading(false);
+          addLog(`Graph successfully started running on ${device}.`, "success");
+        }
       } catch (err) {
-        addLog("Failed to initialize TFLite delegate.", "error");
-        console.error(err);
+        if (isActive) {
+          addLog(`Failed to initialize TFLite delegate on ${device}.`, "error");
+          console.error(err);
+          setIsLoading(false);
+        }
       }
     };
 
     initDetector();
     return () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      isActive = false;
+      detectorRef.current = null;
+      if (instance) {
+        instance.close();
+      }
     };
+  }, [addLog, device, precision, model, testMode]);
+
+  // Clean up animation frame purely on unmount
+  useEffect(() => {
+    return () => {
+      if (requestRef.current) {
+        cancelAnimationFrame(requestRef.current);
+        requestRef.current = null;
+      }
+    };
+  }, []);
+
+  const runImageInference = useCallback(async () => {
+    if (detectorRef.current && imageRef.current) {
+      const startTimeMs = performance.now();
+      try {
+        const result: ObjectDetectorResult = detectorRef.current.detect(imageRef.current);
+        const endTimeMs = performance.now();
+        const currentLatency = endTimeMs - startTimeMs;
+
+        setLatency(currentLatency);
+        // FPS is not relevant for static images, but we could set it to 0 or N/A
+        setFps(0);
+
+        const targets = ['cell phone', 'book', 'laptop', 'person'];
+        const filtered = result.detections.filter((d: any) =>
+          targets.includes(d.categories[0].categoryName || '')
+        );
+
+        setDetections(filtered);
+        addLog(`Image inference complete: ${filtered.length} objects found.`, "success");
+      } catch (e) {
+        addLog("Error during image inference.", "error");
+        console.error(e);
+      }
+    }
   }, [addLog]);
 
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const url = URL.createObjectURL(file);
+      setSelectedImage(url);
+      setDetections([]);
+      addLog(`Image uploaded: ${file.name}`, "info");
+
+      // We need to wait for the image to load before running inference
+      // This will be handled by an onLoad handler on the image element
+    }
+  };
+
   const predictWebcam = useCallback(() => {
-    if (detector && videoRef.current && videoRef.current.readyState >= 2) {
+    if (detectorRef.current && videoRef.current && videoRef.current.readyState >= 2) {
+      // --- PERFORMANCE METRIC START ---
       const startTimeMs = performance.now();
-      const result: ObjectDetectorResult = detector.detectForVideo(videoRef.current, startTimeMs);
 
-      const targets = ['cell phone', 'book', 'laptop', 'person'];
-      const filtered = result.detections.filter((d: any) =>
-        targets.includes(d.categories[0].categoryName || '')
-      );
+      try {
+        // Inference
+        const result: ObjectDetectorResult = detectorRef.current.detectForVideo(videoRef.current, startTimeMs);
 
-      filtered.forEach((d: any) => {
-        const label = d.categories[0].categoryName;
-        if (label !== 'person' && detections.length === 0) {
-          addLog(`Violation: ${label.toUpperCase()} detected!`, "warn");
-        }
-      });
+        const endTimeMs = performance.now();
+        const currentLatency = endTimeMs - startTimeMs;
 
-      setDetections(filtered);
+      // FPS Calculation
+      const frameDelta = endTimeMs - lastFrameTime.current;
+      const currentFps = 1000 / frameDelta;
+
+      setLatency(currentLatency);
+      setFps(currentFps);
+      lastFrameTime.current = endTimeMs;
+      // ---------------------------------
+
+        const targets = ['cell phone', 'book', 'laptop', 'person'];
+        const filtered = result.detections.filter((d: any) =>
+          targets.includes(d.categories[0].categoryName || '')
+        );
+
+        setDetections(filtered);
+      } catch (e) {
+        // Ignore inference errors (e.g. from hot-swapping closed detector)
+      }
     }
     requestRef.current = requestAnimationFrame(predictWebcam);
-  }, [detector, detections.length, addLog]);
+  }, []);
 
   const enableCam = async () => {
-    if (!detector) return;
+    if (!detectorRef.current && !isLoading) return;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       if (videoRef.current) {
@@ -88,7 +173,9 @@ function App() {
         videoRef.current.onloadedmetadata = () => {
           setIsCameraActive(true);
           addLog("Webcam stream active.", "success");
-          predictWebcam();
+          if (!requestRef.current) {
+            predictWebcam();
+          }
         };
       }
     } catch (err) {
@@ -101,41 +188,168 @@ function App() {
       <aside className="side-panel">
         <div className="panel-header">System Configuration</div>
         <div className="config-content">
-          <div className="config-item"><span>WebGL Support</span> <span className="green">Yes</span></div>
-          <div className="config-item"><span>GPU Delegate</span> <span className="green">Enabled</span></div>
+          <div className="config-item"><span>Engine</span> <span>MediaPipe</span></div>
+          <div className="config-item">
+            <span>Model</span>
+            <select
+              value={model}
+              onChange={(e) => setModel(e.target.value as 'efficientdet_lite0' | 'ssd_mobilenet_v2')}
+              className="device-select"
+            >
+              <option value="efficientdet_lite0">EfficientDet Lite0</option>
+              <option value="ssd_mobilenet_v2">SSD MobileNet V2</option>
+            </select>
+          </div>
+          <div className="config-item">
+            <span>Delegate</span>
+            <select
+              value={device}
+              onChange={(e) => setDevice(e.target.value as 'GPU' | 'CPU')}
+              className="device-select"
+            >
+              <option value="GPU">GPU</option>
+              <option value="CPU">CPU</option>
+            </select>
+          </div>
+          <div className="config-item">
+            <span>Test Mode</span>
+            <select
+              value={testMode}
+              onChange={(e) => {
+                setTestMode(e.target.value as 'webcam' | 'image');
+                setDetections([]);
+              }}
+              className="device-select"
+            >
+              <option value="webcam">Webcam Feed</option>
+              <option value="image">Image Upload</option>
+            </select>
+          </div>
+          <div className="config-item">
+            <span>Precision</span>
+            <select
+              value={precision}
+              onChange={(e) => setPrecision(e.target.value as 'float32' | 'float16' | 'int8')}
+              className="device-select"
+            >
+              <option value="float32">Float 32</option>
+              <option value="float16">Float 16</option>
+              <option value="int8">Int 8</option>
+            </select>
+          </div>
+
+          {/* --- PERFORMANCE DISPLAY --- */}
+          <div className="config-item">
+            <span>Inference Latency</span>
+            <span className={latency > 50 ? "warn" : "green"}>{latency.toFixed(1)} ms</span>
+          </div>
+          <div className="config-item">
+            <span>Throughput</span>
+            <span className={fps < 20 ? "warn" : "green"}>{fps.toFixed(1)} FPS</span>
+          </div>
+          {/* -------------------------- */}
+
           <div className="config-item"><span>Resolution</span> <span>640x480</span></div>
-          <div className="config-item"><span>Active Device</span> <span className="small">HP HD Camera</span></div>
-          <div className="config-item"><span>JS Heap</span> <span>12.4 MB</span></div>
+          <div className="config-item"><span>JS Heap</span> <span>{(performance as any).memory?.usedJSHeapSize ? `${(Math.round((performance as any).memory.usedJSHeapSize / 1048576))} MB` : 'N/A'}</span></div>
         </div>
       </aside>
 
       <main className={`monitor-panel ${isLoading ? 'invisible' : ''}`}>
-        <div className="panel-header">Webcam Monitor</div>
+        <div className="panel-header">{testMode === 'webcam' ? 'Webcam Monitor' : 'Image Monitor'}</div>
         <div className="monitor-container">
-          {!isCameraActive && (
-            <button className="mdc-button" onClick={enableCam} disabled={isLoading}>
-              {isLoading ? "LOADING..." : "ENABLE WEBCAM"}
-            </button>
-          )}
+          {testMode === 'webcam' ? (
+            <>
+              {!isCameraActive && (
+                <button className="mdc-button" onClick={enableCam} disabled={isLoading}>
+                  {isLoading ? "LOADING..." : "ENABLE WEBCAM"}
+                </button>
+              )}
 
-          <div className="video-viewport">
-            <video ref={videoRef} autoPlay playsInline muted />
-            {detections.map((det, index) => {
-              const { width, height, originX, originY } = det.boundingBox;
-              const displayX = videoRef.current ? videoRef.current.offsetWidth - width - originX : originX;
-              const rawLabel = det.categories[0].categoryName;
+              <div className="video-viewport">
+                <video ref={videoRef} autoPlay playsInline muted />
+                {detections.map((det, index) => {
+                  if (!videoRef.current) return null;
+                  const { width, height, originX, originY } = det.boundingBox;
+                  const displayWidth = videoRef.current.offsetWidth;
+                  const displayHeight = videoRef.current.offsetHeight;
+                  const naturalWidth = videoRef.current.videoWidth || 1;
+                  const naturalHeight = videoRef.current.videoHeight || 1;
 
-              let displayLabel = rawLabel;
+                  const sX = displayWidth / naturalWidth;
+                  const sY = displayHeight / naturalHeight;
 
-              return (
-                <div key={index} className="detection-box" style={{ left: displayX, top: originY, width, height }}>
-                  <span className="confidence-tag">
-                    {displayLabel} - {Math.round(det.categories[0].score * 100)}%
-                  </span>
+                  const boxWidth = width * sX;
+                  const boxHeight = height * sY;
+                  const boxX = displayWidth - boxWidth - (originX * sX);
+                  const boxY = originY * sY;
+
+                  return (
+                    <div key={index} className="detection-box" style={{ left: boxX, top: boxY, width: boxWidth, height: boxHeight }}>
+                      <span className="confidence-tag">
+                        {det.categories[0].categoryName} - {Math.round(det.categories[0].score * 100)}%
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          ) : (
+            <>
+              <input
+                type="file"
+                accept="image/*"
+                ref={fileInputRef}
+                style={{ display: 'none' }}
+                onChange={handleImageUpload}
+              />
+              {!selectedImage && (
+                <button className="mdc-button" onClick={() => fileInputRef.current?.click()} disabled={isLoading}>
+                  {isLoading ? "LOADING..." : "UPLOAD TEST IMAGE"}
+                </button>
+              )}
+
+              {selectedImage && (
+                <div className="image-test-wrapper">
+                  <div className="video-viewport static-viewport">
+                    <img
+                      ref={imageRef}
+                      src={selectedImage}
+                      alt="Upload"
+                      onLoad={runImageInference}
+                      style={{ width: '100%', display: 'block' }}
+                    />
+                    {detections.map((det, index) => {
+                      if (!imageRef.current) return null;
+                      const { width, height, originX, originY } = det.boundingBox;
+                      const displayWidth = imageRef.current.offsetWidth;
+                      const displayHeight = imageRef.current.offsetHeight;
+                      const naturalWidth = imageRef.current.naturalWidth || 1;
+                      const naturalHeight = imageRef.current.naturalHeight || 1;
+
+                      const sX = displayWidth / naturalWidth;
+                      const sY = displayHeight / naturalHeight;
+
+                      const boxWidth = width * sX;
+                      const boxHeight = height * sY;
+                      const boxX = originX * sX;
+                      const boxY = originY * sY;
+
+                      return (
+                        <div key={index} className="detection-box" style={{ left: boxX, top: boxY, width: boxWidth, height: boxHeight }}>
+                          <span className="confidence-tag">
+                            {det.categories[0].categoryName} - {Math.round(det.categories[0].score * 100)}%
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <button className="mdc-button secondary-btn" onClick={() => fileInputRef.current?.click()}>
+                    CHANGE IMAGE
+                  </button>
                 </div>
-              );
-            })}
-          </div>
+              )}
+            </>
+          )}
         </div>
         <div className="status-bar">
           {detections.some(d => d.categories[0].categoryName !== 'person') ? (
